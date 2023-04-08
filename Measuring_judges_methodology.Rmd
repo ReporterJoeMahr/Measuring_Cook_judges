@@ -1,0 +1,175 @@
+# How long do Leighton courthouse judges take to dispose of murder cases?
+## by Joe Mahr/ Chicago Tribune
+
+```{r setup, echo=T, error=F, results=F, message=F, warning=F}
+library(knitr)
+opts_chunk$set(out.width="900px", dpi=300)
+```
+
+This analysis uses [R](https://www.r-project.org/) code, with source data from the Cook County State's Attorney's office which is updated several times a year. (Here's a [nice primer](https://www.cookcountystatesattorney.org/about/open-data) on its data.) This analysis builds on another analysis I did -- called Cook_murder_case_length -- so you may want to check that out before diving into this. A key difference is how case length is measured, with this measurement from arraignment (and not arrest, as in Cook_murder_case_length analysis).
+
+Also, one major caveat: This measures the time a case took, and the judge at the time of disposition. Typically, a judge hears a case throughout, but there are cases where judges have retired or been re-assigned, and a new judge came in to finish the case. Unfortunately, the county data was not detailed enough to determine in which cases that may have happened, and the court and circuit clerk did not provide more complete court data that would have clarified that. 
+
+ 
+### **Getting the data**
+
+The main data comes from the Cook County state's attorney's office, and is explained more thoroughly in Cook_murder_case_length analysis. One good thing is that, in that Cook_murder_case_length analysis, I produced a basic dataset of every murder disposition. So I grabbed that, along with the original dispositions raw data as well as another raw dataset, on case initiations, to use as a double-check on getting arraignment dates. You'll need to grab those four files from this [Google Drive folder](https://drive.google.com/drive/folders/14ZmsHEKsgEgV64EnfvKtDNzAYwLxFeVq?usp=share_link), and then put it in a folder you create in your working directory called raw_data.
+
+```{r loading, warning=F, message=F, results=F}
+
+# List of packages for session
+.packages = c("ggplot2", "tidyverse", "lubridate", "data.table")
+
+# Install CRAN packages (if not already installed)
+.inst <- .packages %in% installed.packages()
+if(length(.packages[!.inst]) > 0) install.packages(.packages[!.inst])
+
+# Load packages into session 
+lapply(.packages, require, character.only=TRUE)
+
+#Here is our raw data, which we pull from our working directory:
+SA_dispositions <- read_csv("raw_data/SA_dispositions.csv",show_col_types = FALSE)
+
+SA_initiations <- read_csv("raw_data/SA_initiations.csv",show_col_types = FALSE)
+
+#Here's a more massaged file from an earlier crunch (Length_of_cases) to save us time:
+murder_defendants_dispositions_fixed <- read_csv("raw_data/murder_defendants_dispositions_fixed.csv",show_col_types = FALSE)
+
+
+```
+
+### **Preparing the data**
+
+As noted above, the good news is that a lot of preparation was done in the Cook_murder_case_length analysis. That created a dataset of all murder dispositions, with dates. The problem is they did not include arraignment dates. (Side note: An arraignment is an early stage court hearing, when a trial judge first gets a case transferred from judges handling the initial steps of approving of an arrest and detention.) So, to prepare this data, I took that disposition dataset and dug back into the raw data for arraignment dates.
+
+```{r, results=F, message=F, warning=F}
+
+#The first step is to grab each judge at disposition as well as arraignment dates:
+
+Step_1_judges_compare <- murder_defendants_dispositions_fixed %>% 
+  #Let's pull out judge as well as arraignment date:
+  left_join(SA_dispositions %>% dplyr::select(CASE_ID, CASE_PARTICIPANT_ID, ARRAIGNMENT_DATE, JUDGE) %>% distinct(),
+                      by = c("CASE_ID","CASE_PARTICIPANT_ID")) %>% 
+  #As a backup to ensure we get arraignment dates, we'll park (and clean up) this datasets arraignment date in a newly named field, then erase the original field (so we can do another join later): 
+  mutate(Disp_Arraign_date=mdy_hms(ARRAIGNMENT_DATE)) %>% 
+  select(-ARRAIGNMENT_DATE) %>% 
+  #Here is that second left join to another dataset, to fetch another arraignment date in case it was missing from the dispositions dataset. It turned out that this dataset didn't have any additional ones, but good to have this code just in case:
+  left_join(SA_initiations %>% dplyr::select(CASE_ID, CASE_PARTICIPANT_ID, ARRAIGNMENT_DATE) %>% distinct(),
+            by = c("CASE_ID","CASE_PARTICIPANT_ID")) %>% 
+  #To keep track of which dataset provided the arraignment date, we'll rename the Initiations date as a new field (and clean it up):
+  mutate(Init_Arraign_date=mdy_hms(ARRAIGNMENT_DATE)) %>% 
+  select(-ARRAIGNMENT_DATE) %>% 
+  #Now we'll figure out which of these arraignment dates we can use
+  mutate(ARRAIGNMENT_DATE=fifelse(is.na(Disp_Arraign_date),Init_Arraign_date,Disp_Arraign_date)) %>% 
+  #This limits to just 2015 thru 2022 cases
+  filter(DISPOSITION_DATE>="2015-01-01") %>% 
+  filter(DISPOSITION_DATE<="2022-12-31") 
+
+#The result is 1,392 unique cases. Unfortunately just 1,261 have arraignment dates listed. That means a little less than 10% lack times.
+
+```
+
+### **Analyzing the data**
+
+The next step was figuring out, for each judge in Leighton in 2022, how long cases took, based on the data that I had that was complete. I also computed side figures for cases before the pandemic (2015 through 3/16/2020) and during the pandemic (everything since, thru 12/31/2022).
+
+```{r, results=F, message=F, warning=F}
+
+#This isolates to cases where we have an arraignment date, then computes time, then eliminates likely data errors (cases with negative # of days to dispose, or days beyond 13 years (which suggests problem with data entry)):
+Step_2_judges_compare <- Step_1_judges_compare %>% 
+  filter(!is.na(ARRAIGNMENT_DATE)) %>% 
+  mutate(Disposition_days=difftime(DISPOSITION_DATE,ARRAIGNMENT_DATE,units = "days")) %>% 
+  #We also need to eliminate any cases with obvious data errors (such as arraignment taking place after a disposition)
+  filter(Disposition_days>=0) %>% 
+  filter(Disposition_days/365.25<13)
+
+#This computes medians for judges, then limits to those with at least 20. (we'll later remove to just leighton)
+
+Step_3_judges_compare <- Step_2_judges_compare %>% 
+  select(JUDGE,Disposition_days) %>% 
+  ungroup() %>% 
+  group_by(JUDGE) %>% 
+  summarize(count=n(),
+            Overall_median=median(Disposition_days)) %>% 
+  filter(count>=20)
+
+#Now we need to backtrack a bit to figure out which cases were disposed before the pandemic, and which ones were disposed during:
+
+Step_4_judges_compare <- Step_2_judges_compare %>% 
+  mutate(Case_category="Pre-pandemic") %>% 
+  mutate(Case_category=ifelse(DISPOSITION_DATE>"2020-03-17","Pandemic",Case_category))
+
+#Let's get a count on each case category for each judge
+
+Step_5a_judges_compare <- Step_4_judges_compare %>% 
+  select(JUDGE,Case_category,Disposition_days) %>% 
+  filter(Case_category=="Pre-pandemic") %>% 
+  ungroup() %>% 
+  group_by(JUDGE,Case_category) %>% 
+  summarize(Pre_pandemic_count=n(),
+            Pre_pandemic_median=median(Disposition_days)) %>% 
+  mutate(Pre_pandemic_median=round(as.numeric(Pre_pandemic_median)/365.25,1))
+
+Step_5b_judges_compare <- Step_4_judges_compare %>% 
+  select(JUDGE,Case_category,Disposition_days) %>% 
+  filter(Case_category=="Pandemic") %>% 
+  ungroup() %>% 
+  group_by(JUDGE,Case_category) %>% 
+  summarize(Pandemic_count=n(),
+            Pandemic_median=median(Disposition_days)) %>% 
+  mutate(Pandemic_median=round(as.numeric(Pandemic_median)/365.25,1))
+
+#This takes those judges with at least 20 cases, then gets their data
+Step_6_judges_compare <- Step_3_judges_compare %>% 
+  left_join(Step_5a_judges_compare, by="JUDGE") %>% 
+  left_join(Step_5b_judges_compare, by="JUDGE") %>% 
+  select(1:3,5,6,8,9) %>% 
+  mutate(Overall_median=round(as.numeric(Overall_median)/365.25,1))
+
+#This filters just for Leighton judges active as of 2022:
+Final_judges_compare <- Step_6_judges_compare %>% 
+  filter(JUDGE!="Brian K Flaherty") %>% 
+  filter(JUDGE!="Geary W Kull") %>% 
+  filter(JUDGE!="Maura  Slattery Boyle") %>% 
+  filter(JUDGE!="Michele M Pitman") %>% 
+  filter(JUDGE!="Nicholas R Ford") %>% 
+  filter(JUDGE!="Thaddeus L Wilson") %>% 
+  filter(JUDGE!="Thomas J Hennelly") %>% 
+  filter(JUDGE!="Thomas V Gainer") %>% 
+  filter(JUDGE!="William G Lacy") %>% 
+  filter(JUDGE!="Matthew E Coghlan") %>% 
+  #This also fixes judge names:
+  mutate(JUDGE=ifelse(JUDGE=="Carol M Howard","Carol M. Howard",JUDGE)) %>% 
+  mutate(JUDGE=ifelse(JUDGE=="Charles P Burns","Charles P. Burns",JUDGE)) %>% 
+  mutate(JUDGE=ifelse(JUDGE=="James B Linn","James B. Linn",JUDGE)) %>% 
+  mutate(JUDGE=ifelse(JUDGE=="James Michael Obbish","James M. Obbish",JUDGE)) %>% 
+  mutate(JUDGE=ifelse(JUDGE=="Joseph Michael Claps","Joseph M. Claps",JUDGE)) %>% 
+  mutate(JUDGE=ifelse(JUDGE=="Kenneth J Wadas","Kenneth J. Wadas",JUDGE)) %>% 
+  mutate(JUDGE=ifelse(JUDGE=="Lawrence Edward Flood","Lawrence E. Flood",JUDGE)) %>% 
+  mutate(JUDGE=ifelse(JUDGE=="Stanley  Sacks","Stanley Sacks",JUDGE)) %>% 
+  mutate(JUDGE=ifelse(JUDGE=="Timothy Joseph Joyce","Timothy J. Joyce",JUDGE)) %>% 
+  mutate(JUDGE=ifelse(JUDGE=="Lawrence Edward Flood","Lawrence E. Flood",JUDGE)) %>% 
+  mutate(JUDGE=ifelse(JUDGE=="Vincent M Gaughan","Vincent M. Gaughan",JUDGE)) %>% 
+  mutate(JUDGE=ifelse(JUDGE=="William H Hooks","William H. Hooks",JUDGE)) %>% 
+  mutate(JUDGE=ifelse(JUDGE=="Byrne, Thomas","Thomas J. Byrne",JUDGE)) %>% 
+  arrange(Overall_median)
+
+#A copy of this chart is in the Final_data folder
+
+
+```
+
+Here is the final data, by judge:
+
+```{r, results=F, message=F, warning=F}
+
+kable(Final_judges_compare)
+```
+Here is what the chart looks like:
+
+```{r, results=F, message=F, warning=F}
+
+ggplot(Final_judges_compare) +
+  geom_col(aes(Overall_median,reorder(JUDGE,-Overall_median)))
+
+```
